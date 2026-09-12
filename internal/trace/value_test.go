@@ -37,6 +37,22 @@ func TestValueRoundTrips(t *testing.T) {
 	}
 }
 
+func TestValueKindNames(t *testing.T) {
+	kinds := map[ValueKind]string{
+		ValueInvalid:   "invalid",
+		ValueString:    "string",
+		ValueBool:      "bool",
+		ValueInt:       "int",
+		ValueFloat:     "float",
+		ValueKind(200): "invalid",
+	}
+	for kind, want := range kinds {
+		if got := kind.String(); got != want {
+			t.Errorf("ValueKind(%d).String() = %q, want %q", kind, got, want)
+		}
+	}
+}
+
 func TestTypedAccessors(t *testing.T) {
 	if got, ok := StringValue("checkout").AsString(); !ok || got != "checkout" {
 		t.Errorf("AsString() = %q, %v; want %q, true", got, ok, "checkout")
