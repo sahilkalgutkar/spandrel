@@ -1,0 +1,17 @@
+# build output
+/bin/
+/dist/
+
+# test + coverage artifacts
+*.out
+*.test
+coverage/
+/tmp/
+
+# local span data
+/data/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
