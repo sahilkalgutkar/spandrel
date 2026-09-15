@@ -15,3 +15,10 @@ comment:
   layout: "reach, diff, flags, files"
   behavior: default
   require_changes: true
+
+ignore:
+  # Nothing but a file-level pattern works here, so this skips the whole
+  # daemon file. That is acceptable only because serve, run and parseFlags
+  # are covered by cmd/spandreld/main_test.go regardless; the number just
+  # stops counting main, which only calls run and exits.
+  - "cmd/spandreld/main.go"
