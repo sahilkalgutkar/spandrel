@@ -21,6 +21,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/sahilkalgutkar/spandrel/internal/ingest"
+	"github.com/sahilkalgutkar/spandrel/internal/storage"
 )
 
 func main() {
@@ -35,6 +36,8 @@ type config struct {
 	httpAddr     string
 	logLevel     slog.Level
 	drainTimeout time.Duration
+	dataDir      string
+	retention    time.Duration
 }
 
 func parseFlags(args []string) (config, error) {
@@ -46,6 +49,8 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&cfg.grpcAddr, "grpc-addr", ":4317", "address for OpenTelemetry gRPC exports")
 	fs.StringVar(&cfg.httpAddr, "http-addr", ":4318", "address for OpenTelemetry HTTP exports")
 	fs.DurationVar(&cfg.drainTimeout, "drain-timeout", 10*time.Second, "how long in-flight exports get to finish on shutdown")
+	fs.StringVar(&cfg.dataDir, "data-dir", "", "directory to keep spans in; empty keeps them in memory only")
+	fs.DurationVar(&cfg.retention, "retention", 72*time.Hour, "how long a trace is kept after it ends; 0 keeps everything")
 	level := fs.String("log-level", "info", "debug, info, warn or error")
 
 	if err := fs.Parse(args); err != nil {
@@ -53,6 +58,9 @@ func parseFlags(args []string) (config, error) {
 	}
 	if err := cfg.logLevel.UnmarshalText([]byte(*level)); err != nil {
 		return cfg, fmt.Errorf("invalid -log-level %q", *level)
+	}
+	if cfg.retention < 0 {
+		return cfg, fmt.Errorf("invalid -retention %v: cannot be negative", cfg.retention)
 	}
 	return cfg, nil
 }
@@ -68,9 +76,16 @@ func run(args []string, logOut *os.File) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Nothing downstream exists yet, so spans are recorded in memory. This is
-	// the one line that changes when the sampler lands.
-	sink := &ingest.Recorder{}
+	store, err := openStore(cfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Error("closing store", "error", err)
+		}
+	}()
+	go evictLoop(ctx, store, time.Minute, logger)
 
 	grpcLis, err := net.Listen("tcp", cfg.grpcAddr)
 	if err != nil {
@@ -82,7 +97,48 @@ func run(args []string, logOut *os.File) error {
 		return fmt.Errorf("listening for HTTP on %s: %w", cfg.httpAddr, err)
 	}
 
-	return serve(ctx, logger, sink, grpcLis, httpLis, cfg.drainTimeout)
+	// The store sits directly behind ingest for now. When the sampler lands
+	// it goes in between, and this is the line that changes.
+	return serve(ctx, logger, store, grpcLis, httpLis, cfg.drainTimeout)
+}
+
+// store is what the daemon needs from either storage implementation.
+type store interface {
+	storage.Store
+	ingest.Sink
+	EvictExpired() int
+}
+
+// openStore keeps spans in memory when no data directory is given, which is
+// the right default for trying it out and the wrong one for anything you
+// would be upset to lose on a restart.
+func openStore(cfg config) (store, error) {
+	if cfg.dataDir == "" {
+		return storage.NewMemory(cfg.retention, nil), nil
+	}
+	d, err := storage.OpenDisk(cfg.dataDir, cfg.retention, nil)
+	if err != nil {
+		return nil, fmt.Errorf("opening store in %s: %w", cfg.dataDir, err)
+	}
+	return d, nil
+}
+
+// evictLoop drops expired traces every interval until ctx ends. Eviction takes
+// the store's write lock, so running it on a ticker rather than on every write
+// keeps its cost out of the ingest path.
+func evictLoop(ctx context.Context, s store, interval time.Duration, logger *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n := s.EvictExpired(); n > 0 {
+				logger.Debug("evicted expired traces", "count", n)
+			}
+		}
+	}
 }
 
 // serve runs both transports on listeners the caller already holds, until ctx
