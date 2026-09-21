@@ -47,6 +47,9 @@ func render(t *Tree) string {
 		if n.Missing() {
 			fmt.Fprintf(&b, " (%s)", n.Presence)
 		}
+		if n.CycleBroken {
+			b.WriteString(" (cycle)")
+		}
 		b.WriteByte('\n')
 		return true
 	})
@@ -329,5 +332,108 @@ func TestPresenceString(t *testing.T) {
 		if got := p.String(); got != want {
 			t.Errorf("%d.String() = %q, want %q", p, got, want)
 		}
+	}
+}
+
+func TestBuildBreaksCycles(t *testing.T) {
+	tests := []struct {
+		name       string
+		spans      []trace.Span
+		want       string
+		wantCycles []byte
+	}{
+		{
+			name: "two spans naming each other",
+			spans: []trace.Span{
+				span(2, 3, 10, 20),
+				span(3, 2, 15, 25),
+			},
+			want:       "2 (cycle)\n  3\n",
+			wantCycles: []byte{2},
+		},
+		{
+			name: "a loop of three is cut at its earliest span, not its first to arrive",
+			spans: []trace.Span{
+				span(4, 3, 30, 40),
+				span(2, 4, 5, 50),
+				span(3, 2, 20, 45),
+			},
+			want:       "2 (cycle)\n  3\n    4\n",
+			wantCycles: []byte{2},
+		},
+		{
+			name: "spans hanging off a loop come back with it",
+			spans: []trace.Span{
+				span(1, 0, 0, 100),
+				span(2, 3, 10, 60),
+				span(3, 2, 20, 50),
+				span(4, 3, 30, 40),
+				span(5, 4, 32, 38),
+			},
+			want:       "1\n2 (cycle)\n  3\n    4\n      5\n",
+			wantCycles: []byte{2},
+		},
+		{
+			name: "a span that is its own parent",
+			spans: []trace.Span{
+				span(1, 0, 0, 100),
+				span(2, 2, 10, 20),
+			},
+			want:       "1\n2 (cycle)\n",
+			wantCycles: []byte{2},
+		},
+		{
+			name: "separate loops are each cut once",
+			spans: []trace.Span{
+				span(6, 7, 60, 70),
+				span(7, 6, 65, 75),
+				span(2, 3, 10, 20),
+				span(3, 2, 15, 25),
+			},
+			want:       "2 (cycle)\n  3\n6 (cycle)\n  7\n",
+			wantCycles: []byte{2, 6},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tree := mustBuild(t, tt.spans...)
+			if got := render(tree); got != tt.want {
+				t.Errorf("tree:\n%s\nwant:\n%s", got, tt.want)
+			}
+
+			var cycles []byte
+			for _, c := range tree.Cycles() {
+				cycles = append(cycles, c.Span.SpanID[7])
+			}
+			if string(cycles) != string(tt.wantCycles) {
+				t.Errorf("Cycles() = %v, want %v", cycles, tt.wantCycles)
+			}
+			if tree.Complete() {
+				t.Error("Complete() = true for a tree that needed repair")
+			}
+
+			visited := 0
+			tree.Walk(func(*Node, int) bool { visited++; return true })
+			if visited != len(tt.spans) {
+				t.Errorf("Walk visited %d nodes, want all %d", visited, len(tt.spans))
+			}
+		})
+	}
+}
+
+func TestBrokenCycleKeepsItsParentID(t *testing.T) {
+	tree := mustBuild(t, span(2, 3, 10, 20), span(3, 2, 15, 25))
+
+	cut := tree.Cycles()[0]
+	if cut.Parent != nil {
+		t.Error("the cut span still has a parent node")
+	}
+	if cut.Span.ParentSpanID != sid(3) {
+		t.Errorf("the cut span's ParentSpanID = %s, want it left as sent", cut.Span.ParentSpanID)
+	}
+	other, _ := tree.Node(sid(3))
+	if len(other.Children) != 0 {
+		t.Errorf("span 3 still lists %d children after the cut", len(other.Children))
 	}
 }
