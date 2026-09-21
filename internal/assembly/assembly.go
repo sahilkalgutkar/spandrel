@@ -107,9 +107,10 @@ type Tree struct {
 // missing parent stay together that way, and the placeholder records what the
 // tree is waiting for. Whether the parent is still expected depends on phase.
 //
-// The result does not depend on the order of spans. A span identifier that
-// appears more than once keeps its last occurrence, which is the same rule
-// the store applies to a retried export.
+// A span identifier that appears more than once keeps its last occurrence,
+// which is the same rule the store applies to a retried export. Apart from
+// which copy of a duplicate survives, the result does not depend on the order
+// of spans.
 func Build(spans []trace.Span, phase Phase) (*Tree, error) {
 	if len(spans) == 0 {
 		return nil, ErrNoSpans
