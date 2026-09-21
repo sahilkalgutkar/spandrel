@@ -38,19 +38,31 @@ func span(id, parent byte, start, end int) trace.Span {
 }
 
 // render draws the tree one node per line, indented by depth, which makes a
-// wrong shape obvious in a failure message.
+// wrong shape obvious in a failure message. Placeholders are marked with
+// their presence.
 func render(t *Tree) string {
 	var b strings.Builder
 	t.Walk(func(n *Node, depth int) bool {
-		fmt.Fprintf(&b, "%s%d\n", strings.Repeat("  ", depth), n.Span.SpanID[7])
+		fmt.Fprintf(&b, "%s%d", strings.Repeat("  ", depth), n.Span.SpanID[7])
+		if n.Missing() {
+			fmt.Fprintf(&b, " (%s)", n.Presence)
+		}
+		b.WriteByte('\n')
 		return true
 	})
 	return b.String()
 }
 
+// mustBuild assembles an open trace, which is what most tests want: whether
+// a trace is sealed only matters once something is missing.
 func mustBuild(t *testing.T, spans ...trace.Span) *Tree {
 	t.Helper()
-	tree, err := Build(spans)
+	return mustBuildIn(t, Open, spans...)
+}
+
+func mustBuildIn(t *testing.T, phase Phase, spans ...trace.Span) *Tree {
+	t.Helper()
+	tree, err := Build(spans, phase)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -169,7 +181,7 @@ func TestBuildRejects(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := Build(tt.spans); !errors.Is(err, tt.want) {
+			if _, err := Build(tt.spans, Open); !errors.Is(err, tt.want) {
 				t.Errorf("Build error = %v, want %v", err, tt.want)
 			}
 		})
@@ -192,5 +204,130 @@ func TestWalkStopsEarly(t *testing.T) {
 
 	if want := []byte{1, 2}; string(seen) != string(want) {
 		t.Errorf("visited %v, want %v", seen, want)
+	}
+}
+
+func TestBuildMissingParents(t *testing.T) {
+	tests := []struct {
+		name        string
+		phase       Phase
+		spans       []trace.Span
+		want        string
+		wantMissing []byte
+	}{
+		{
+			name:  "a parent that has not arrived yet is awaited",
+			phase: Open,
+			spans: []trace.Span{
+				span(1, 0, 0, 100),
+				span(3, 2, 20, 30),
+			},
+			want:        "1\n2 (awaited)\n  3\n",
+			wantMissing: []byte{2},
+		},
+		{
+			name:  "the same parent in a sealed trace is lost",
+			phase: Sealed,
+			spans: []trace.Span{
+				span(1, 0, 0, 100),
+				span(3, 2, 20, 30),
+			},
+			want:        "1\n2 (lost)\n  3\n",
+			wantMissing: []byte{2},
+		},
+		{
+			name:  "siblings with the same missing parent stay together",
+			phase: Sealed,
+			spans: []trace.Span{
+				span(4, 2, 40, 50),
+				span(1, 0, 0, 100),
+				span(3, 2, 20, 30),
+			},
+			want:        "1\n2 (lost)\n  3\n  4\n",
+			wantMissing: []byte{2},
+		},
+		{
+			name:  "a missing root leaves the rest of the trace under its placeholder",
+			phase: Sealed,
+			spans: []trace.Span{
+				span(2, 1, 10, 90),
+				span(3, 2, 20, 30),
+				span(4, 1, 5, 95),
+			},
+			want:        "1 (lost)\n  4\n  2\n    3\n",
+			wantMissing: []byte{1},
+		},
+		{
+			name:  "separate gaps get separate placeholders, earliest first",
+			phase: Open,
+			spans: []trace.Span{
+				span(1, 0, 0, 100),
+				span(8, 7, 60, 70),
+				span(6, 5, 20, 30),
+			},
+			want:        "1\n5 (awaited)\n  6\n7 (awaited)\n  8\n",
+			wantMissing: []byte{5, 7},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tree := mustBuildIn(t, tt.phase, tt.spans...)
+			if got := render(tree); got != tt.want {
+				t.Errorf("tree:\n%s\nwant:\n%s", got, tt.want)
+			}
+
+			var missing []byte
+			for _, m := range tree.Missing() {
+				missing = append(missing, m.Span.SpanID[7])
+			}
+			if string(missing) != string(tt.wantMissing) {
+				t.Errorf("Missing() = %v, want %v", missing, tt.wantMissing)
+			}
+			if tree.Len() != len(tt.spans) {
+				t.Errorf("Len() = %d, want %d: placeholders are not spans", tree.Len(), len(tt.spans))
+			}
+			if tree.Complete() {
+				t.Error("Complete() = true for a tree with a missing parent")
+			}
+		})
+	}
+}
+
+func TestPlaceholderCoversItsChildren(t *testing.T) {
+	tree := mustBuildIn(t, Sealed,
+		span(3, 2, 20, 30),
+		span(4, 2, 10, 25),
+	)
+
+	p := tree.Missing()[0]
+	if want := epoch.Add(10 * time.Millisecond); !p.Span.Start.Equal(want) {
+		t.Errorf("placeholder starts at %v, want %v", p.Span.Start, want)
+	}
+	if want := epoch.Add(30 * time.Millisecond); !p.Span.End.Equal(want) {
+		t.Errorf("placeholder ends at %v, want %v", p.Span.End, want)
+	}
+	if p.Span.TraceID != testTrace {
+		t.Error("placeholder does not carry the trace identifier")
+	}
+	if _, ok := tree.Node(sid(2)); ok {
+		t.Error("Node returned a placeholder as if it had arrived")
+	}
+}
+
+func TestComplete(t *testing.T) {
+	if !mustBuild(t, span(1, 0, 0, 100), span(2, 1, 10, 20)).Complete() {
+		t.Error("a whole trace is not Complete")
+	}
+	if mustBuild(t, span(1, 0, 0, 10), span(2, 0, 20, 30)).Complete() {
+		t.Error("a trace with two roots is Complete")
+	}
+}
+
+func TestPresenceString(t *testing.T) {
+	for p, want := range map[Presence]string{Received: "received", Awaited: "awaited", Lost: "lost"} {
+		if got := p.String(); got != want {
+			t.Errorf("%d.String() = %q, want %q", p, got, want)
+		}
 	}
 }
