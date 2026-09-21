@@ -197,6 +197,11 @@ func (t *Tree) Cycles() []*Node { return t.cycles }
 // Complete reports whether the tree is one trace with nothing missing and
 // nothing repaired: a single root that really is a root, and every parent
 // accounted for.
+//
+// It can only see gaps that some span points at. A leaf that was dropped
+// leaves nothing behind that names it, so a trace missing only leaves still
+// looks complete. No tree builder can do better than that: the spans that
+// arrived are all it has.
 func (t *Tree) Complete() bool {
 	return len(t.missing) == 0 && len(t.cycles) == 0 && len(t.Roots) == 1
 }
