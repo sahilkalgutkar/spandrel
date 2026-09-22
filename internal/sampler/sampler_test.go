@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sahilkalgutkar/spandrel/internal/ingest"
 	"github.com/sahilkalgutkar/spandrel/internal/trace"
 )
 
@@ -69,6 +70,7 @@ func newSampler(t *testing.T, policies []Policy) (*Sampler, *clock, *writer) {
 	s, err := New(Config{
 		Quiet:    time.Second,
 		MaxAge:   5 * time.Second,
+		MaxSpans: 1000,
 		Policies: policies,
 		Now:      c.Now,
 	}, w)
@@ -112,9 +114,10 @@ func TestNewRejects(t *testing.T) {
 		cfg  Config
 		out  Writer
 	}{
-		{"no writer", Config{Quiet: time.Second, MaxAge: time.Minute}, nil},
-		{"no quiet period", Config{MaxAge: time.Minute}, w},
-		{"max age under the quiet period", Config{Quiet: time.Minute, MaxAge: time.Second}, w},
+		{"no writer", Config{Quiet: time.Second, MaxAge: time.Minute, MaxSpans: 1}, nil},
+		{"no quiet period", Config{MaxAge: time.Minute, MaxSpans: 1}, w},
+		{"max age under the quiet period", Config{Quiet: time.Minute, MaxAge: time.Second, MaxSpans: 1}, w},
+		{"no room for spans", Config{Quiet: time.Second, MaxAge: time.Minute}, w},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -126,7 +129,7 @@ func TestNewRejects(t *testing.T) {
 }
 
 func TestNewDefaultsTheClock(t *testing.T) {
-	s, err := New(Config{Quiet: time.Second, MaxAge: time.Second}, newWriter())
+	s, err := New(Config{Quiet: time.Second, MaxAge: time.Second, MaxSpans: 1}, newWriter())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,5 +324,53 @@ func TestConcurrentAcceptAndSweep(t *testing.T) {
 	}
 	if total != 8*50 {
 		t.Errorf("wrote %d spans in total, want all %d", total, 8*50)
+	}
+}
+
+func smallSampler(t *testing.T, maxSpans int) (*Sampler, *clock, *writer) {
+	t.Helper()
+	c, w := newClock(), newWriter()
+	s, err := New(Config{Quiet: time.Second, MaxAge: 5 * time.Second, MaxSpans: maxSpans, Policies: keepAll, Now: c.Now}, w)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return s, c, w
+}
+
+func TestAFullBufferRefusesWithBackpressure(t *testing.T) {
+	s, c, w := smallSampler(t, 3)
+	accept(t, s, in(1, span(1, 0, 0, 10)), in(1, span(2, 1, 1, 5)))
+
+	// Two more would make four. The whole batch is refused, including the
+	// span that would have fit.
+	err := s.Accept(context.Background(), []trace.Span{in(2, span(1, 0, 0, 10)), in(2, span(2, 1, 1, 5))})
+	if !errors.Is(err, ingest.ErrSinkFull) {
+		t.Fatalf("Accept error = %v, want ingest.ErrSinkFull", err)
+	}
+	if st := s.Stats(); st.Refused != 2 || st.Buffered != 2 || st.Traces != 1 {
+		t.Errorf("Refused = %d, Buffered = %d, Traces = %d, want 2, 2, 1", st.Refused, st.Buffered, st.Traces)
+	}
+
+	// Filling it exactly is fine.
+	accept(t, s, in(2, span(1, 0, 0, 10)))
+
+	// Once a sweep has judged what was there, the retry gets in.
+	c.advance(time.Second)
+	sweep(t, s)
+	accept(t, s, in(3, span(1, 0, 0, 10)), in(3, span(2, 1, 1, 5)))
+
+	if len(w.spans(traceID(1))) != 2 || len(w.spans(traceID(2))) != 1 {
+		t.Error("the traces buffered before the refusal were not written")
+	}
+}
+
+func TestABatchLargerThanTheBufferIsNotRetryable(t *testing.T) {
+	s, _, _ := smallSampler(t, 2)
+	err := s.Accept(context.Background(), []trace.Span{span(1, 0, 0, 10), span(2, 1, 1, 5), span(3, 1, 6, 9)})
+	if !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("Accept error = %v, want ErrBatchTooLarge", err)
+	}
+	if errors.Is(err, ingest.ErrSinkFull) {
+		t.Error("an oversized batch looks retryable; the client would resend it forever")
 	}
 }

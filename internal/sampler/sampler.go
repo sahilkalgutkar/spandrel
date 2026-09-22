@@ -9,8 +9,15 @@ import (
 	"time"
 
 	"github.com/sahilkalgutkar/spandrel/internal/assembly"
+	"github.com/sahilkalgutkar/spandrel/internal/ingest"
 	"github.com/sahilkalgutkar/spandrel/internal/trace"
 )
+
+// ErrBatchTooLarge is returned for a batch with more spans than the buffer
+// can ever hold. It deliberately does not wrap ingest.ErrSinkFull: a retry
+// would be refused the same way, forever, so the client has to be told to
+// stop rather than to back off.
+var ErrBatchTooLarge = errors.New("sampler: batch is larger than the whole buffer")
 
 // Writer is where kept traces go. The store satisfies it.
 type Writer interface {
@@ -30,6 +37,12 @@ type Config struct {
 	// stops, would otherwise stay in memory forever.
 	MaxAge time.Duration
 
+	// MaxSpans caps how many spans can be buffered at once, across all
+	// traces. Past it, Accept refuses with ingest.ErrSinkFull, which the
+	// export handlers turn into a retryable error, so the pressure goes back
+	// to the clients instead of into this process's memory.
+	MaxSpans int
+
 	// Policies judge each trace once it is sealed. See Decide.
 	Policies []Policy
 
@@ -39,8 +52,10 @@ type Config struct {
 
 // Stats counts what the sampler has done since it started.
 type Stats struct {
-	// Accepted counts spans taken into the buffer.
-	Accepted int64
+	// Accepted counts spans taken into the buffer, and Refused counts spans
+	// turned away because it was full. Refused spans were not lost: the
+	// client was told to retry them.
+	Accepted, Refused int64
 
 	// Buffered and Traces are how many spans, and how many traces, are
 	// waiting to be judged right now.
@@ -96,6 +111,8 @@ func New(cfg Config, out Writer) (*Sampler, error) {
 		return nil, fmt.Errorf("sampler: quiet period must be positive, got %v", cfg.Quiet)
 	case cfg.MaxAge < cfg.Quiet:
 		return nil, fmt.Errorf("sampler: max age %v is shorter than the quiet period %v", cfg.MaxAge, cfg.Quiet)
+	case cfg.MaxSpans <= 0:
+		return nil, fmt.Errorf("sampler: max spans must be positive, got %d", cfg.MaxSpans)
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -109,11 +126,23 @@ func New(cfg Config, out Writer) (*Sampler, error) {
 }
 
 // Accept buffers spans until their traces are judged.
+//
+// A batch that would take the buffer past MaxSpans is refused whole. Taking
+// part of it would need a way to tell the client which part, and the protocol
+// has none: a retry resends the whole batch either way.
 func (s *Sampler) Accept(_ context.Context, spans []trace.Span) error {
+	if len(spans) > s.cfg.MaxSpans {
+		return fmt.Errorf("%w: %d spans, buffer holds %d", ErrBatchTooLarge, len(spans), s.cfg.MaxSpans)
+	}
 	now := s.cfg.Now()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.stats.Buffered+len(spans) > s.cfg.MaxSpans {
+		s.stats.Refused += int64(len(spans))
+		return fmt.Errorf("%w: %d of %d spans buffered", ingest.ErrSinkFull, s.stats.Buffered, s.cfg.MaxSpans)
+	}
 
 	for _, sp := range spans {
 		p, ok := s.pending[sp.TraceID]
