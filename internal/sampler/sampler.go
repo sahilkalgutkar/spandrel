@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -48,6 +49,9 @@ type Config struct {
 
 	// Now is the clock. Tests replace it; nil means time.Now.
 	Now func() time.Time
+
+	// Logger receives the errors Run cannot return. Nil discards them.
+	Logger *slog.Logger
 }
 
 // Stats counts what the sampler has done since it started.
@@ -117,6 +121,9 @@ func New(cfg Config, out Writer) (*Sampler, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.DiscardHandler)
+	}
 	return &Sampler{
 		cfg:     cfg,
 		out:     out,
@@ -176,6 +183,38 @@ func (s *Sampler) Sweep(ctx context.Context) error {
 		}
 		return false
 	})
+}
+
+// Flush judges every buffered trace now, whether or not it looks finished.
+//
+// It is for shutdown. A trace cut off by a restart is judged on the spans
+// that arrived, which is incomplete but honest. Dropping it unjudged would
+// silently lose an error trace that happened to be in flight.
+func (s *Sampler) Flush(ctx context.Context) error {
+	return s.judge(ctx, func(*pending) bool { return true })
+}
+
+// Run sweeps every interval until ctx is done, then flushes.
+//
+// Sweep errors are logged, not returned: one failed write should not stop
+// the sampler for every trace after it, and Stats.Lost already counts the
+// damage. The flush at the end runs on a context that ignores the
+// cancellation that triggered it, since otherwise shutting down would cancel
+// the very writes the flush is there to make. Its error is returned.
+func (s *Sampler) Run(ctx context.Context, interval time.Duration) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return s.Flush(context.WithoutCancel(ctx))
+		case <-ticker.C:
+			if err := s.Sweep(ctx); err != nil {
+				s.cfg.Logger.Error("sampler sweep", "error", err)
+			}
+		}
+	}
 }
 
 // judge removes the traces due says are ready, then decides on each and

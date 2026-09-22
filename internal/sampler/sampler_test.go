@@ -1,8 +1,11 @@
 package sampler
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -373,4 +376,112 @@ func TestABatchLargerThanTheBufferIsNotRetryable(t *testing.T) {
 	if errors.Is(err, ingest.ErrSinkFull) {
 		t.Error("an oversized batch looks retryable; the client would resend it forever")
 	}
+}
+
+func TestFlushJudgesEverythingNow(t *testing.T) {
+	s, _, w := newSampler(t, keepAll)
+	accept(t, s, in(1, span(1, 0, 0, 10)), in(2, span(2, 9, 1, 5)))
+
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if len(w.spans(traceID(1))) != 1 || len(w.spans(traceID(2))) != 1 {
+		t.Error("Flush left traces unjudged")
+	}
+	if st := s.Stats(); st.Traces != 0 || st.Buffered != 0 {
+		t.Errorf("Traces = %d, Buffered = %d after Flush", st.Traces, st.Buffered)
+	}
+}
+
+// ctxWriter fails any write whose context is already done, the way a store
+// honouring cancellation would.
+type ctxWriter struct{ *writer }
+
+func (w ctxWriter) Write(ctx context.Context, spans []trace.Span) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return w.writer.Write(ctx, spans)
+}
+
+func TestRunSweepsAndFlushesOnShutdown(t *testing.T) {
+	c, w := newClock(), newWriter()
+	s, err := New(Config{Quiet: time.Second, MaxAge: time.Minute, MaxSpans: 100, Policies: keepAll, Now: c.Now}, ctxWriter{w})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx, time.Millisecond) }()
+
+	// A quiet trace is picked up by a tick.
+	accept(t, s, in(1, span(1, 0, 0, 10)))
+	c.advance(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(w.spans(traceID(1))) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Run never swept the quiet trace")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A trace still in flight at shutdown is flushed, on a context the
+	// shutdown did not cancel.
+	accept(t, s, in(2, span(1, 0, 0, 10)))
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(w.spans(traceID(2))) != 1 {
+		t.Error("the in-flight trace was not flushed on shutdown")
+	}
+}
+
+func TestRunLogsSweepErrors(t *testing.T) {
+	var logs bytes.Buffer
+	c, w := newClock(), newWriter()
+	w.fail[traceID(1)] = true
+	s, err := New(Config{
+		Quiet: time.Second, MaxAge: time.Minute, MaxSpans: 100, Policies: keepAll, Now: c.Now,
+		Logger: slog.New(slog.NewTextHandler(&syncWriter{w: &logs}, nil)),
+	}, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accept(t, s, in(1, span(1, 0, 0, 10)))
+	c.advance(time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx, time.Millisecond) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for s.Stats().Lost == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the failing write never happened")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(logs.String(), "disk full") {
+		t.Errorf("the sweep error was not logged; logs:\n%s", logs.String())
+	}
+}
+
+// syncWriter serialises writes to a buffer shared between the Run goroutine
+// and the test.
+type syncWriter struct {
+	mu sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
