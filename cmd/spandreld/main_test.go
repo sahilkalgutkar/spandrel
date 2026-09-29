@@ -7,6 +7,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +23,7 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/sahilkalgutkar/spandrel/internal/ingest"
+	"github.com/sahilkalgutkar/spandrel/internal/storage"
 	"github.com/sahilkalgutkar/spandrel/internal/trace"
 )
 
@@ -217,6 +221,9 @@ func TestParseFlags(t *testing.T) {
 	if cfg.grpcAddr != ":4317" || cfg.httpAddr != ":4318" || cfg.logLevel != slog.LevelInfo {
 		t.Errorf("defaults = %+v, want the standard OpenTelemetry ports at info", cfg)
 	}
+	if cfg.dataDir != "" || cfg.retention != 72*time.Hour {
+		t.Errorf("defaults = %+v, want in-memory storage and 72h retention", cfg)
+	}
 
 	cfg, err = parseFlags([]string{"-grpc-addr", "127.0.0.1:9000", "-log-level", "debug", "-drain-timeout", "3s"})
 	if err != nil {
@@ -232,6 +239,9 @@ func TestParseFlags(t *testing.T) {
 	if _, err := parseFlags([]string{"-no-such-flag"}); err == nil {
 		t.Error("an unknown flag was accepted")
 	}
+	if _, err := parseFlags([]string{"-retention", "-1h"}); err == nil {
+		t.Error("a negative retention was accepted")
+	}
 }
 
 func TestRunRefusesAnAddressInUse(t *testing.T) {
@@ -245,5 +255,91 @@ func TestRunRefusesAnAddressInUse(t *testing.T) {
 	var opErr *net.OpError
 	if !errors.As(err, &opErr) {
 		t.Errorf("run with a taken port returned %v, want a listen error", err)
+	}
+}
+
+func TestOpenStore(t *testing.T) {
+	t.Run("memory when no data directory is given", func(t *testing.T) {
+		s, err := openStore(config{retention: time.Hour})
+		if err != nil {
+			t.Fatalf("openStore: %v", err)
+		}
+		defer s.Close()
+		if _, ok := s.(*storage.Memory); !ok {
+			t.Errorf("openStore returned %T, want *storage.Memory", s)
+		}
+	})
+
+	t.Run("disk keeps spans across a restart", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := config{dataDir: dir}
+
+		s, err := openStore(cfg)
+		if err != nil {
+			t.Fatalf("openStore: %v", err)
+		}
+		span := trace.Span{Name: "GET /", Service: "api", Start: time.Now(), End: time.Now()}
+		span.TraceID[0], span.SpanID[0] = 1, 1
+		if err := s.Accept(context.Background(), []trace.Span{span}); err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		s, err = openStore(cfg)
+		if err != nil {
+			t.Fatalf("reopening: %v", err)
+		}
+		defer s.Close()
+		if _, err := s.Trace(context.Background(), span.TraceID); err != nil {
+			t.Errorf("span did not survive a restart: %v", err)
+		}
+	})
+
+	t.Run("an unusable data directory is an error", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(file, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openStore(config{dataDir: file}); err == nil {
+			t.Error("openStore accepted a regular file as its data directory")
+		}
+	})
+}
+
+type countingStore struct {
+	*storage.Memory
+	evictions atomic.Int32
+}
+
+func (c *countingStore) EvictExpired() int {
+	c.evictions.Add(1)
+	return c.Memory.EvictExpired()
+}
+
+func TestEvictLoopRunsUntilCancelled(t *testing.T) {
+	s := &countingStore{Memory: storage.NewMemory(time.Hour, nil)}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		evictLoop(ctx, s, time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		close(done)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for s.evictions.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("evictLoop did not run eviction repeatedly")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("evictLoop kept running after its context was cancelled")
 	}
 }
