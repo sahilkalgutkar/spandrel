@@ -220,8 +220,8 @@ func TestDiskClosed(t *testing.T) {
 	if err := d.Close(); err != nil {
 		t.Errorf("second Close = %v, want nil", err)
 	}
-	if err := d.Accept(ctx, []trace.Span{spec{1, 1, 0, "a", "b", 0, 0, false}.span()}); !errors.Is(err, ErrClosed) {
-		t.Errorf("Accept after Close = %v, want ErrClosed", err)
+	if err := d.Write(ctx, []trace.Span{spec{1, 1, 0, "a", "b", 0, 0, false}.span()}); !errors.Is(err, ErrClosed) {
+		t.Errorf("Write after Close = %v, want ErrClosed", err)
 	}
 }
 

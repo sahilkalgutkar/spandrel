@@ -333,16 +333,6 @@ func TestClosedStore(t *testing.T) {
 	}
 }
 
-func TestAcceptWrites(t *testing.T) {
-	m := NewMemory(0, nil)
-	if err := m.Accept(ctx, []trace.Span{spec{1, 1, 0, "a", "b", 0, time.Second, false}.span()}); err != nil {
-		t.Fatalf("Accept: %v", err)
-	}
-	if m.Len() != 1 {
-		t.Errorf("Len = %d after Accept, want 1", m.Len())
-	}
-}
-
 // Many exports arrive at once and searches run while they do. This is here
 // for the race detector more than for its assertions.
 func TestConcurrentWritesAndReads(t *testing.T) {
