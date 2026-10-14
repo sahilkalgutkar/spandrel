@@ -280,8 +280,8 @@ func TestOpenStore(t *testing.T) {
 		}
 		span := trace.Span{Name: "GET /", Service: "api", Start: time.Now(), End: time.Now()}
 		span.TraceID[0], span.SpanID[0] = 1, 1
-		if err := s.Accept(context.Background(), []trace.Span{span}); err != nil {
-			t.Fatalf("Accept: %v", err)
+		if err := s.Write(context.Background(), []trace.Span{span}); err != nil {
+			t.Fatalf("Write: %v", err)
 		}
 		if err := s.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
