@@ -1,6 +1,6 @@
 // Package ingest accepts spans over the OpenTelemetry protocol and hands them
-// to whatever comes next. Today that is a sink the caller supplies; once the
-// sampler exists it will be the sampler.
+// to whatever comes next, a sink the caller supplies. In the daemon that is
+// the sampler.
 package ingest
 
 import (
@@ -19,8 +19,7 @@ type Sink interface {
 	Accept(ctx context.Context, spans []trace.Span) error
 }
 
-// Recorder is a Sink that keeps everything it is given. It exists for tests
-// and for running the daemon before there is anywhere better to send spans.
+// Recorder is a Sink that keeps everything it is given. It exists for tests.
 type Recorder struct {
 	mu    sync.Mutex
 	spans []trace.Span
