@@ -61,6 +61,20 @@ type Config struct {
 	// span.
 	MaxDecisions int
 
+	// ServiceRate caps how many traces a second each service can have kept,
+	// counting a trace against the service of its root span. A service in
+	// trouble fails every request it serves, KeepErrors keeps every one of
+	// those traces, and without a cap that one service takes the whole
+	// storage budget at the moment the others' traces matter most. The cap
+	// applies to every kept trace, errors included: it still keeps
+	// ServiceRate of them a second, which is plenty to see what went wrong.
+	// Zero means no cap.
+	ServiceRate float64
+
+	// ServiceBurst is how many traces a service can have kept back to back
+	// before ServiceRate starts to apply.
+	ServiceBurst int
+
 	// Now is the clock. Tests replace it; nil means time.Now.
 	Now func() time.Time
 
@@ -132,6 +146,25 @@ type Sampler struct {
 	// the next sweep writes them. Writing them from Accept would put the
 	// store's latency on the ingest path.
 	late map[trace.TraceID][]trace.Span
+
+	// buckets hold each service's allowance of kept traces. A bucket that has
+	// refilled is the same as no bucket, so sweeps remove those, and a
+	// service that stops sending costs nothing.
+	buckets map[string]*bucket
+}
+
+type bucket struct {
+	tokens float64
+	at     time.Time
+}
+
+// refill adds what the rate has earned since the bucket was last touched, up
+// to the burst.
+func (b *bucket) refill(now time.Time, rate float64, burst int) {
+	if elapsed := now.Sub(b.at); elapsed > 0 {
+		b.tokens = min(float64(burst), b.tokens+rate*elapsed.Seconds())
+		b.at = now
+	}
 }
 
 type decision struct {
@@ -170,6 +203,10 @@ func New(cfg Config, out Writer) (*Sampler, error) {
 		return nil, fmt.Errorf("sampler: remember must not be negative, got %v", cfg.Remember)
 	case cfg.Remember > 0 && cfg.MaxDecisions <= 0:
 		return nil, fmt.Errorf("sampler: remembering verdicts needs room for them, got max decisions %d", cfg.MaxDecisions)
+	case !(cfg.ServiceRate >= 0):
+		return nil, fmt.Errorf("sampler: service rate must not be negative, got %v", cfg.ServiceRate)
+	case cfg.ServiceRate > 0 && cfg.ServiceBurst < 1:
+		return nil, fmt.Errorf("sampler: a service rate needs a burst of at least 1, got %d", cfg.ServiceBurst)
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -185,6 +222,7 @@ func New(cfg Config, out Writer) (*Sampler, error) {
 		judging: make(map[trace.TraceID][]trace.Span),
 		decided: make(map[trace.TraceID]decision),
 		late:    make(map[trace.TraceID][]trace.Span),
+		buckets: make(map[string]*bucket),
 	}, nil
 }
 
@@ -354,6 +392,9 @@ func (s *Sampler) decide(ctx context.Context, p *pending) error {
 	// Build can refuse.
 	tree, _ := assembly.Build(p.spans, assembly.Sealed)
 	v := Decide(tree, s.cfg.Policies)
+	if v.Keep && s.cfg.ServiceRate > 0 && !s.allow(rootService(tree)) {
+		v = Verdict{Keep: false, Reason: "rate limited"}
+	}
 
 	var err error
 	if v.Keep {
@@ -420,12 +461,18 @@ func (s *Sampler) settle(id trace.TraceID, keep bool) {
 	}
 }
 
-// forget drops the verdicts older than Remember. The lock must not be held.
+// forget drops the verdicts older than Remember, and the buckets of services
+// that have their full allowance back. The lock must not be held.
 func (s *Sampler) forget(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for len(s.order) > 0 && now.Sub(s.order[0].at) >= s.cfg.Remember {
 		s.forgetOldest()
+	}
+	for service, b := range s.buckets {
+		if b.refill(now, s.cfg.ServiceRate, s.cfg.ServiceBurst); b.tokens >= float64(s.cfg.ServiceBurst) {
+			delete(s.buckets, service)
+		}
 	}
 }
 
@@ -467,4 +514,38 @@ func (s *Sampler) writeLate(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// allow takes one kept trace from service's allowance, and reports whether
+// there was one to take.
+func (s *Sampler) allow(service string) bool {
+	now := s.cfg.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.buckets[service]
+	if !ok {
+		b = &bucket{tokens: float64(s.cfg.ServiceBurst), at: now}
+		s.buckets[service] = b
+	}
+	b.refill(now, s.cfg.ServiceRate, s.cfg.ServiceBurst)
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// rootService is the service a trace is charged to: its root span's, or when
+// the root never arrived, that of the first span that did, walking down from
+// the earliest root.
+func rootService(t *assembly.Tree) string {
+	var service string
+	t.Walk(func(n *assembly.Node, _ int) bool {
+		if n.Missing() {
+			return true
+		}
+		service = n.Span.Service
+		return false
+	})
+	return service
 }
