@@ -353,9 +353,6 @@ func (d *Disk) repair() error {
 	return nil
 }
 
-// Accept lets the store sit directly behind the ingest path.
-func (d *Disk) Accept(ctx context.Context, spans []trace.Span) error { return d.Write(ctx, spans) }
-
 // Trace returns every span of one trace, ordered by start time.
 func (d *Disk) Trace(ctx context.Context, id trace.TraceID) ([]trace.Span, error) {
 	return d.mem.Trace(ctx, id)

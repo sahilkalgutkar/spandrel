@@ -111,12 +111,6 @@ func (m *Memory) Write(_ context.Context, spans []trace.Span) error {
 	return nil
 }
 
-// Accept lets the store sit directly behind the ingest path until the sampler
-// exists to go in between.
-func (m *Memory) Accept(ctx context.Context, spans []trace.Span) error {
-	return m.Write(ctx, spans)
-}
-
 func (m *Memory) insert(s trace.Span) {
 	e, ok := m.traces[s.TraceID]
 	if !ok {
