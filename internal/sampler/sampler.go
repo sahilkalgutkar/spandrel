@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -47,6 +48,19 @@ type Config struct {
 	// Policies judge each trace once it is sealed. See Decide.
 	Policies []Policy
 
+	// Remember is how long a verdict is kept after a trace is judged, so that
+	// spans arriving later follow it: written if the trace was kept, dropped
+	// if not. Without it, a late span opens a fresh buffer and is judged on
+	// its own, and a late span from a kept error trace usually is not an
+	// error itself, so it gets dropped from a trace that was kept. Zero
+	// remembers nothing.
+	Remember time.Duration
+
+	// MaxDecisions caps how many verdicts are remembered at once. Past it the
+	// oldest is forgotten first, which is the one least likely to see another
+	// span.
+	MaxDecisions int
+
 	// Now is the clock. Tests replace it; nil means time.Now.
 	Now func() time.Time
 
@@ -56,13 +70,14 @@ type Config struct {
 
 // Stats counts what the sampler has done since it started.
 type Stats struct {
-	// Accepted counts spans taken into the buffer, and Refused counts spans
-	// turned away because it was full. Refused spans were not lost: the
-	// client was told to retry them.
+	// Accepted counts spans taken from clients, and Refused counts spans
+	// turned away because the buffer was full. Refused spans were not lost:
+	// the client was told to retry them.
 	Accepted, Refused int64
 
-	// Buffered and Traces are how many spans, and how many traces, are
-	// waiting to be judged right now.
+	// Buffered is how many spans are held right now: waiting to be judged,
+	// or late spans of kept traces waiting to be written. Traces is how many
+	// traces are waiting to be judged.
 	Buffered int
 	Traces   int
 
@@ -82,6 +97,14 @@ type Stats struct {
 	// Lost counts spans of kept traces that the writer refused. They were
 	// meant to be kept and were not, so this is the number to alert on.
 	Lost int64
+
+	// LateKept and LateDropped count spans that arrived after their trace
+	// was judged, or while it was being judged, and followed its verdict.
+	// Many of them mean Quiet is shorter than the gaps inside real traces.
+	LateKept, LateDropped int64
+
+	// Decisions is how many verdicts are remembered right now.
+	Decisions int
 }
 
 // Sampler buffers spans by trace and judges each trace once it looks
@@ -93,6 +116,32 @@ type Sampler struct {
 	mu      sync.Mutex
 	pending map[trace.TraceID]*pending
 	stats   Stats
+
+	// judging holds the traces taken out of pending and not yet decided, with
+	// any spans that arrived for them in the meantime. Those spans wait for
+	// the verdict instead of starting the trace over.
+	judging map[trace.TraceID][]trace.Span
+
+	// decided remembers verdicts, and order lists them oldest first so they
+	// can be forgotten in that order. An entry in order whose time no longer
+	// matches decided is stale: the trace was judged again since.
+	decided map[trace.TraceID]decision
+	order   []remembered
+
+	// late holds spans of kept traces that arrived after the verdict, until
+	// the next sweep writes them. Writing them from Accept would put the
+	// store's latency on the ingest path.
+	late map[trace.TraceID][]trace.Span
+}
+
+type decision struct {
+	keep bool
+	at   time.Time
+}
+
+type remembered struct {
+	id trace.TraceID
+	at time.Time
 }
 
 type pending struct {
@@ -117,6 +166,10 @@ func New(cfg Config, out Writer) (*Sampler, error) {
 		return nil, fmt.Errorf("sampler: max age %v is shorter than the quiet period %v", cfg.MaxAge, cfg.Quiet)
 	case cfg.MaxSpans <= 0:
 		return nil, fmt.Errorf("sampler: max spans must be positive, got %d", cfg.MaxSpans)
+	case cfg.Remember < 0:
+		return nil, fmt.Errorf("sampler: remember must not be negative, got %v", cfg.Remember)
+	case cfg.Remember > 0 && cfg.MaxDecisions <= 0:
+		return nil, fmt.Errorf("sampler: remembering verdicts needs room for them, got max decisions %d", cfg.MaxDecisions)
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -129,14 +182,22 @@ func New(cfg Config, out Writer) (*Sampler, error) {
 		out:     out,
 		pending: make(map[trace.TraceID]*pending),
 		stats:   Stats{Reasons: make(map[string]int64)},
+		judging: make(map[trace.TraceID][]trace.Span),
+		decided: make(map[trace.TraceID]decision),
+		late:    make(map[trace.TraceID][]trace.Span),
 	}, nil
 }
 
 // Accept buffers spans until their traces are judged.
 //
+// A span whose trace has already been judged follows the verdict: it is
+// queued for the next sweep to write if the trace was kept, and dropped if
+// not. A span whose trace is being judged right now waits for the verdict.
+//
 // A batch that would take the buffer past MaxSpans is refused whole. Taking
 // part of it would need a way to tell the client which part, and the protocol
-// has none: a retry resends the whole batch either way.
+// has none: a retry resends the whole batch either way. Late spans of dropped
+// traces take no room, so they do not count.
 func (s *Sampler) Accept(_ context.Context, spans []trace.Span) error {
 	if len(spans) > s.cfg.MaxSpans {
 		return fmt.Errorf("%w: %d spans, buffer holds %d", ErrBatchTooLarge, len(spans), s.cfg.MaxSpans)
@@ -146,12 +207,31 @@ func (s *Sampler) Accept(_ context.Context, spans []trace.Span) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.stats.Buffered+len(spans) > s.cfg.MaxSpans {
+	held := 0
+	for i := range spans {
+		if keep, decided := s.verdict(spans[i].TraceID, now); !decided || keep {
+			held++
+		}
+	}
+	if s.stats.Buffered+held > s.cfg.MaxSpans {
 		s.stats.Refused += int64(len(spans))
 		return fmt.Errorf("%w: %d of %d spans buffered", ingest.ErrSinkFull, s.stats.Buffered, s.cfg.MaxSpans)
 	}
 
 	for _, sp := range spans {
+		if waiting, ok := s.judging[sp.TraceID]; ok {
+			s.judging[sp.TraceID] = append(waiting, sp)
+			continue
+		}
+		if keep, decided := s.verdict(sp.TraceID, now); decided {
+			if keep {
+				s.late[sp.TraceID] = append(s.late[sp.TraceID], sp)
+				s.stats.LateKept++
+			} else {
+				s.stats.LateDropped++
+			}
+			continue
+		}
 		p, ok := s.pending[sp.TraceID]
 		if !ok {
 			p = &pending{id: sp.TraceID, first: now}
@@ -161,8 +241,23 @@ func (s *Sampler) Accept(_ context.Context, spans []trace.Span) error {
 		p.last = now
 	}
 	s.stats.Accepted += int64(len(spans))
-	s.stats.Buffered += len(spans)
+	s.stats.Buffered += held
 	return nil
+}
+
+// verdict reports whether the trace has been judged and, if so, whether it
+// was kept. A trace being judged right now counts as undecided but its spans
+// are held, which is what the caller needs to size the batch. The lock must
+// be held.
+func (s *Sampler) verdict(id trace.TraceID, now time.Time) (keep, decided bool) {
+	if _, ok := s.judging[id]; ok {
+		return false, false
+	}
+	d, ok := s.decided[id]
+	if !ok || now.Sub(d.at) >= s.cfg.Remember {
+		return false, false
+	}
+	return d.keep, true
 }
 
 // Sweep judges every trace that has gone quiet or reached its maximum age,
@@ -173,7 +268,7 @@ func (s *Sampler) Accept(_ context.Context, spans []trace.Span) error {
 // writer refused are counted in Stats.Lost.
 func (s *Sampler) Sweep(ctx context.Context) error {
 	now := s.cfg.Now()
-	return s.judge(ctx, func(p *pending) bool {
+	err := s.judge(ctx, func(p *pending) bool {
 		switch {
 		case now.Sub(p.last) >= s.cfg.Quiet:
 			return true
@@ -183,6 +278,8 @@ func (s *Sampler) Sweep(ctx context.Context) error {
 		}
 		return false
 	})
+	s.forget(now)
+	return errors.Join(err, s.writeLate(ctx))
 }
 
 // Flush judges every buffered trace now, whether or not it looks finished.
@@ -191,7 +288,8 @@ func (s *Sampler) Sweep(ctx context.Context) error {
 // that arrived, which is incomplete but honest. Dropping it unjudged would
 // silently lose an error trace that happened to be in flight.
 func (s *Sampler) Flush(ctx context.Context) error {
-	return s.judge(ctx, func(*pending) bool { return true })
+	err := s.judge(ctx, func(*pending) bool { return true })
+	return errors.Join(err, s.writeLate(ctx))
 }
 
 // Run sweeps every interval until ctx is done, then flushes.
@@ -228,6 +326,7 @@ func (s *Sampler) judge(ctx context.Context, due func(*pending) bool) error {
 		if due(p) {
 			ready = append(ready, p)
 			delete(s.pending, id)
+			s.judging[id] = nil
 			s.stats.Buffered -= len(p.spans)
 		}
 	}
@@ -265,6 +364,7 @@ func (s *Sampler) decide(ctx context.Context, p *pending) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.settle(p.id, v.Keep)
 	s.stats.Reasons[v.Reason]++
 	switch {
 	case !v.Keep:
@@ -285,9 +385,86 @@ func (s *Sampler) Stats() Stats {
 	defer s.mu.Unlock()
 	out := s.stats
 	out.Traces = len(s.pending)
+	out.Decisions = len(s.decided)
 	out.Reasons = make(map[string]int64, len(s.stats.Reasons))
 	for k, v := range s.stats.Reasons {
 		out.Reasons[k] = v
 	}
 	return out
+}
+
+// settle ends the judging of a trace: the spans that arrived while it was
+// judged follow the verdict, and the verdict is remembered for spans still to
+// come. The lock must be held.
+func (s *Sampler) settle(id trace.TraceID, keep bool) {
+	waiting := s.judging[id]
+	delete(s.judging, id)
+	switch {
+	case len(waiting) == 0:
+	case keep:
+		s.late[id] = append(s.late[id], waiting...)
+		s.stats.LateKept += int64(len(waiting))
+	default:
+		s.stats.Buffered -= len(waiting)
+		s.stats.LateDropped += int64(len(waiting))
+	}
+
+	if s.cfg.Remember <= 0 {
+		return
+	}
+	now := s.cfg.Now()
+	s.decided[id] = decision{keep: keep, at: now}
+	s.order = append(s.order, remembered{id: id, at: now})
+	for len(s.decided) > s.cfg.MaxDecisions {
+		s.forgetOldest()
+	}
+}
+
+// forget drops the verdicts older than Remember. The lock must not be held.
+func (s *Sampler) forget(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.order) > 0 && now.Sub(s.order[0].at) >= s.cfg.Remember {
+		s.forgetOldest()
+	}
+}
+
+// forgetOldest drops the oldest entry in order, and its verdict unless the
+// trace has been judged again since. The lock must be held.
+func (s *Sampler) forgetOldest() {
+	oldest := s.order[0]
+	s.order[0] = remembered{}
+	s.order = s.order[1:]
+	if d, ok := s.decided[oldest.id]; ok && d.at.Equal(oldest.at) {
+		delete(s.decided, oldest.id)
+	}
+	// Reslicing from the front never gives memory back, so copy once the
+	// dead prefix would be most of the backing array.
+	if cap(s.order) > 64 && len(s.order) < cap(s.order)/4 {
+		s.order = slices.Clone(s.order)
+	}
+}
+
+// writeLate writes the late spans of kept traces, a trace at a time. A failed
+// write counts its spans as lost, like any other kept span the writer refused.
+func (s *Sampler) writeLate(ctx context.Context) error {
+	s.mu.Lock()
+	late := s.late
+	s.late = make(map[trace.TraceID][]trace.Span)
+	for _, spans := range late {
+		s.stats.Buffered -= len(spans)
+	}
+	s.mu.Unlock()
+
+	ids := slices.SortedFunc(maps.Keys(late), func(a, b trace.TraceID) int { return slices.Compare(a[:], b[:]) })
+	var errs []error
+	for _, id := range ids {
+		if err := s.out.Write(ctx, late[id]); err != nil {
+			errs = append(errs, fmt.Errorf("sampler: writing late spans of kept trace %s: %w", id, err))
+			s.mu.Lock()
+			s.stats.Lost += int64(len(late[id]))
+			s.mu.Unlock()
+		}
+	}
+	return errors.Join(errs...)
 }
